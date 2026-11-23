@@ -3,6 +3,7 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { logger } from "@oh-my-pi/pi-utils";
 import { captureRequestHeaders, resolvePromptCacheKey } from "../auth-gateway/http";
 import * as AIError from "../error";
+import { classifyGatewayError } from "../error/gateway";
 import type {
 	AnthropicMessagePayload,
 	AnthropicServerToolContent,
@@ -984,7 +985,10 @@ export function encodeStream(
 						case "error": {
 							const msg = ev.error.errorMessage ?? "stream error";
 							controller.enqueue(
-								sseFrame("error", { type: "error", error: { type: "api_error", message: msg } }),
+								sseFrame("error", {
+									type: "error",
+									error: { type: anthropicErrorType(ev.error), message: msg },
+								}),
 							);
 							controller.close();
 							return;
@@ -1038,6 +1042,25 @@ export function encodeStream(
  * See https://docs.anthropic.com/en/api/errors. Returned as a `Response` so
  * the gateway can hand it straight back to the client without extra wrapping.
  */
+/**
+ * Anthropic error type for a mid-stream failure, so clients that read
+ * `error.type` (rate-limit backoff, provider failover) see `rate_limit_error`
+ * for a 429 instead of a generic `api_error`.
+ */
+function anthropicErrorType(message: AssistantMessage): string {
+	const text = message.errorClassificationMessage ?? message.errorMessage ?? "";
+	const { status } =
+		typeof message.errorStatus === "number"
+			? classifyGatewayError(Object.assign(new Error(text), { status: message.errorStatus }))
+			: classifyGatewayError(text);
+	if (status === 429) return "rate_limit_error";
+	if (status === 529) return "overloaded_error";
+	if (status === 401) return "authentication_error";
+	if (status === 403) return "permission_error";
+	if (status === 400) return "invalid_request_error";
+	return "api_error";
+}
+
 export function formatError(status: number, type: string, message: string): Response {
 	return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
 		status,

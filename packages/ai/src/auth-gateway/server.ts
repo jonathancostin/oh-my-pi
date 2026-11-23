@@ -74,6 +74,7 @@ import { handleSystemOne } from "./routes/systemone";
 import { handleTranscriptions } from "./routes/transcriptions";
 import { handleVideoContent, handleVideoPoll, handleVideoSubmit } from "./routes/video";
 import { AuthGatewaySessionStateStore } from "./session-state";
+import { classifyFailedMessage, peekStream, retryAfterMsFromMessage, withRetryAfter } from "./stream-peek";
 import type {
 	AuthGatewayServerHandle,
 	AuthGatewayFormatModule as FormatModule,
@@ -462,8 +463,11 @@ async function handleFormatEndpoint(
 				if (message.stopReason === "aborted") {
 					return route.module.formatError(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
-				return route.module.formatError(classified.status, classified.type, errorMessage);
+				const classified = classifyFailedMessage(message);
+				return withRetryAfter(
+					route.module.formatError(classified.status, classified.type, errorMessage),
+					retryAfterMsFromMessage(message),
+				);
 			}
 			return json(
 				200,
@@ -516,7 +520,25 @@ async function handleFormatEndpoint(
 			.finally(settle);
 		streamOwnsLease = true;
 
-		const sseStream = route.module.encodeStream(events, parsed.modelId, parsed.options, {
+		// An upstream that fails before streaming any content (429, 401, 400)
+		// is answered with its real status, error type and retry-after, not a
+		// 200 stream carrying a generic error frame: clients decide retry and
+		// failover from the status.
+		const peeked = await peekStream(events, controller.signal);
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		if (peeked.kind === "error") {
+			logger.warn("auth-gateway stream failed before content", {
+				format: route.label,
+				status: peeked.classified.status,
+				error: peeked.classified.message,
+				peer,
+			});
+			return withRetryAfter(
+				route.module.formatError(peeked.classified.status, peeked.classified.type, peeked.classified.message),
+				peeked.retryAfterMs,
+			);
+		}
+		const sseStream = route.module.encodeStream(peeked.events, parsed.modelId, parsed.options, {
 			signal: controller.signal,
 			onCancel: reason => {
 				if (!controller.signal.aborted) {
@@ -683,8 +705,11 @@ async function handlePiNative(
 				if (message.stopReason === "aborted") {
 					return noStoreErrorResponse(499, "request_aborted", errorMessage);
 				}
-				const classified = classifyGatewayError(message.errorClassificationMessage ?? errorMessage);
-				return noStoreErrorResponse(classified.status, classified.type, errorMessage);
+				const classified = classifyFailedMessage(message);
+				return withRetryAfter(
+					noStoreErrorResponse(classified.status, classified.type, errorMessage),
+					retryAfterMsFromMessage(message),
+				);
 			}
 			return json(
 				200,
@@ -733,7 +758,21 @@ async function handlePiNative(
 			.finally(settle);
 		streamOwnsLease = true;
 
-		const sseStream = piNative.encodeStream(events, parsed.modelId, parsed.options, {
+		const peeked = await peekStream(events, controller.signal);
+		if (controller.signal.aborted) return aborted();
+		if (peeked.kind === "error") {
+			logger.warn("auth-gateway stream failed before content", {
+				format: "pi-native",
+				status: peeked.classified.status,
+				error: peeked.classified.message,
+				peer,
+			});
+			return withRetryAfter(
+				noStoreErrorResponse(peeked.classified.status, peeked.classified.type, peeked.classified.message),
+				peeked.retryAfterMs,
+			);
+		}
+		const sseStream = piNative.encodeStream(peeked.events, parsed.modelId, parsed.options, {
 			signal: controller.signal,
 			onCancel: reason => {
 				if (!controller.signal.aborted) {
